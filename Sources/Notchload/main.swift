@@ -23,6 +23,7 @@ final class NotchController: NSObject {
     private var pending: DispatchWorkItem?
     private var pollTimer: Timer?
     private var menuOpen = false
+    private var yielding = false             // another notch app (Notchshelf) is using the space under the notch
 
     func start() {
         panel = NotchPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -47,6 +48,20 @@ final class NotchController: NSObject {
 
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.layout() }
+        }
+
+        // Notchshelf announces when its shelf drops out of the notch; stay closed until it is done.
+        let distributed = DistributedNotificationCenter.default()
+        distributed.addObserver(forName: Notification.Name("com.brijraj.notchshelf.covering"), object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.setYielding(true) }
+        }
+        distributed.addObserver(forName: Notification.Name("com.brijraj.notchshelf.clear"), object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.setYielding(false) }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            guard app?.bundleIdentifier == "com.brijraj.notchshelf" else { return }
+            MainActor.assumeIsolated { self?.setYielding(false) }
         }
 
         let moves: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged]
@@ -93,8 +108,19 @@ final class NotchController: NSObject {
 
     // MARK: Hover
 
+    private func setYielding(_ yielding: Bool) {
+        self.yielding = yielding
+        if yielding {
+            pending?.cancel()
+            pointerInside = false
+            setExpanded(false)
+        } else {
+            pointerMoved()
+        }
+    }
+
     private func pointerMoved() {
-        guard !menuOpen else { return }
+        guard !menuOpen, !yielding else { return }
         let point = NSEvent.mouseLocation
         let inside = tabRect.contains(point) || (state.expanded && bodyRect.contains(point))
         guard inside != pointerInside else { return }
