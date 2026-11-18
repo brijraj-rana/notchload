@@ -8,7 +8,7 @@ struct NotchGeometry: Equatable {
     var notchHeight: CGFloat = 32          // 0 on a screen without a notch
     var collapsedHeight: CGFloat = 24
     var expandedWidth: CGFloat = 372
-    var expandedHeight: CGFloat = 382
+    var expandedHeight: CGFloat = 430
     var margin: CGFloat = 40               // room for the shadow
 
     var windowSize: CGSize {
@@ -18,7 +18,18 @@ struct NotchGeometry: Equatable {
 
 final class PanelState: ObservableObject {
     @Published var expanded = false
+    @Published var pinned = false          // held open by a click instead of the pointer
     @Published var geo = NotchGeometry()
+
+    /// Where each process row sits in the window (top-left origin), so a right-click can find its process.
+    var rowFrames: [Int: CGRect] = [:]
+}
+
+struct RowFramesKey: PreferenceKey {
+    static let defaultValue: [Int: CGRect] = [:]
+    static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
+        value.merge(nextValue()) { _, new in new }
+    }
 }
 
 // MARK: Shape
@@ -128,6 +139,7 @@ struct Sparkline: View {
 
 struct CollapsedView: View {
     let snap: Snapshot
+    var culprit: String? = nil      // shown in place of the trace while load is sustained
 
     var body: some View {
         HStack(spacing: 6) {
@@ -137,9 +149,23 @@ struct CollapsedView: View {
             }
             .frame(width: 46, alignment: .leading)
 
-            Sparkline(values: Array(snap.history.suffix(30)), color: Tone.level(snap.cpu), filled: false)
-                .frame(height: 11)
-                .opacity(0.9)
+            ZStack {
+                if let culprit {
+                    Text(CulpritTracker.displayName(culprit))
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.9))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity)
+                        .transition(.opacity)
+                } else {
+                    Sparkline(values: Array(snap.history.suffix(30)), color: Tone.level(snap.cpu), filled: false)
+                        .frame(height: 11)
+                        .opacity(0.9)
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeOut(duration: 0.25), value: culprit)
 
             HStack(spacing: 3) {
                 Text(Fmt.percent(snap.memFraction)).foregroundStyle(Tone.pressure(snap.memPressure))
@@ -167,6 +193,8 @@ struct ExpandedView: View {
             memorySection
             Divider().overlay(.white.opacity(0.08))
             statsRow
+            Divider().overlay(.white.opacity(0.08))
+            powerRow
             Divider().overlay(.white.opacity(0.08))
             processSection
             Spacer(minLength: 0)
@@ -303,6 +331,46 @@ struct ExpandedView: View {
         }
     }
 
+    @ViewBuilder
+    private var powerRow: some View {
+        HStack(spacing: 0) {
+            if let battery = snap.battery {
+                stat("BATTERY", Fmt.percent(battery.level), color: batteryColor(battery))
+                stat("POWER", powerText(battery), color: .white)
+                stat(battery.source == .battery ? "TIME LEFT" : "TO FULL", timeText(battery), color: .white)
+            }
+            if let disk = snap.disk {
+                if snap.battery == nil {
+                    stat("DISK FREE", "\(Fmt.disk(disk.free)) of \(Fmt.disk(disk.total))", color: Tone.level(disk.usedFraction))
+                } else {
+                    stat("DISK FREE", Fmt.disk(disk.free), color: Tone.level(disk.usedFraction))
+                }
+            } else {
+                stat("DISK FREE", "Unknown", color: .white)
+            }
+        }
+    }
+
+    /// A low battery is the only time the level takes a warning colour, and only while it is draining.
+    private func batteryColor(_ battery: Battery) -> Color {
+        guard battery.source == .battery else { return .white }
+        return battery.level <= 0.1 ? Tone.hot : (battery.level <= 0.2 ? Tone.warm : .white)
+    }
+
+    private func powerText(_ battery: Battery) -> String {
+        switch battery.source {
+        case .battery: return "Battery"
+        case .charging: return "Charging"
+        case .pluggedIn: return "Plugged in"
+        }
+    }
+
+    private func timeText(_ battery: Battery) -> String {
+        if let minutes = battery.minutesRemaining { return Fmt.clock(minutes: minutes) }
+        if battery.source == .pluggedIn { return battery.level >= 0.995 ? "Full" : "On hold" }
+        return "Estimating"
+    }
+
     private func stat(_ title: String, _ value: String, color: Color) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             label(title)
@@ -340,6 +408,9 @@ struct ExpandedView: View {
                         .frame(width: 58, alignment: .trailing)
                 }
                 .font(.system(size: 11, weight: .medium).monospacedDigit())
+                .background(GeometryReader { g in
+                    Color.clear.preference(key: RowFramesKey.self, value: [proc.id: g.frame(in: .named("notchload.root"))])
+                })
             }
         }
     }
@@ -381,9 +452,20 @@ struct RootView: View {
                 if state.expanded {
                     ExpandedView(snap: metrics.snap, processes: metrics.processes, efficiencyCores: metrics.efficiencyCores)
                         .frame(width: g.expandedWidth, height: g.expandedHeight)
+                        .overlay(alignment: .topTrailing) {
+                            if state.pinned {
+                                Image(systemName: "pin.fill")
+                                    .font(.system(size: 8, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(0.55))
+                                    .padding(.top, 7)
+                                    .padding(.trailing, 10)
+                                    .transition(.opacity)
+                                    .accessibilityLabel("Pinned open")
+                            }
+                        }
                         .transition(.opacity)
                 } else {
-                    CollapsedView(snap: metrics.snap)
+                    CollapsedView(snap: metrics.snap, culprit: metrics.culprit)
                         .frame(width: g.notchWidth, height: g.collapsedHeight)
                         .transition(.opacity)
                 }
@@ -394,6 +476,9 @@ struct RootView: View {
         }
         .frame(width: g.windowSize.width, height: g.windowSize.height, alignment: .top)
         .animation(reduceMotion ? .easeOut(duration: 0.15) : .spring(response: 0.36, dampingFraction: 0.82), value: state.expanded)
+        .animation(.easeOut(duration: 0.15), value: state.pinned)
+        .coordinateSpace(name: "notchload.root")
+        .onPreferenceChange(RowFramesKey.self) { state.rowFrames = $0 }
         .ignoresSafeArea()
     }
 }

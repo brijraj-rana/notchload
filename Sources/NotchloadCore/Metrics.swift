@@ -35,6 +35,9 @@ public struct Snapshot {
     public var netUp: Double = 0
     public var thermal: ProcessInfo.ThermalState = .nominal
 
+    public var battery: Battery? = nil         // nil on a Mac without one
+    public var disk: Disk? = nil               // startup disk
+
     public init() {}
 
     public var memUsed: UInt64 { memApp + memWired + memCompressed }
@@ -46,9 +49,18 @@ public final class Metrics: ObservableObject {
     @Published public var snap = Snapshot()
     @Published public var processes: [ProcRow] = []
 
-    /// The process list costs a `ps` spawn, so it only runs while the panel is open.
-    public var wantsProcesses = false {
-        didSet { if wantsProcesses && !oldValue { sampleProcesses() } }
+    /// The process whose name the tab shows while CPU has been high for a long stretch. Nil otherwise.
+    @Published public var culprit: String?
+
+    /// The process list costs a `ps` spawn, so it only runs while the panel is open or load is sustained.
+    /// Battery and disk are only shown in the panel, so after launch they are only read while it is open.
+    public var panelOpen = false {
+        didSet {
+            guard panelOpen && !oldValue else { return }
+            sampleProcesses()
+            samplePower()
+            openTicks = 0
+        }
     }
 
     public let efficiencyCores: Int = {
@@ -63,12 +75,19 @@ public final class Metrics: ObservableObject {
     private var prevNet: [String: (UInt32, UInt32)] = [:]
     private var prevNetTime = Date()
     private var psRunning = false
+    private var powerRunning = false
+    private var tracker: CulpritTracker
+    private var sustainedTicks = 0
+    private var openTicks = 0
     private let psQueue = DispatchQueue(label: "notchload.ps", qos: .utility)
 
-    public init() {}
+    public init(culprit: CulpritTracker.Config = CulpritTracker.Config()) {
+        tracker = CulpritTracker(config: culprit)
+    }
 
     public func start() {
         sample()
+        samplePower()       // once, so the first time the panel opens the row is already filled in
         let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.sample() }
         t.tolerance = 0.1
         RunLoop.main.add(t, forMode: .common)
@@ -84,9 +103,45 @@ public final class Metrics: ObservableObject {
         if getloadavg(&la, 3) == 3 { s.load = la }
         s.thermal = ProcessInfo.processInfo.thermalState
         if tick % 2 == 0 { s.gpu = Self.gpuUtilization() }
+
+        let wasSustained = tracker.sustained
+        let sustained = tracker.feed(cpu: s.cpu)
+        if sustained != wasSustained {
+            sustainedTicks = 0
+            if !sustained, culprit != nil { culprit = nil }
+        }
+
+        if panelOpen {
+            // Battery and disk move slowly; every ten seconds is plenty.
+            if openTicks > 0 && openTicks % 10 == 0 { samplePower() }
+            openTicks += 1
+        }
         snap = s
-        if wantsProcesses && tick % 2 == 0 { sampleProcesses() }
+
+        if panelOpen {
+            if tick % 2 == 0 { sampleProcesses() }
+        } else if sustained && sustainedTicks % 5 == 0 {
+            // Nobody is looking at the list, only the name on the tab, so sample less often.
+            sampleProcesses()
+        }
+        if sustained { sustainedTicks += 1 }
         tick += 1
+    }
+
+    /// Asking for free space takes a few milliseconds, so it happens off the main thread.
+    private func samplePower() {
+        guard !powerRunning else { return }
+        powerRunning = true
+        psQueue.async { [weak self] in
+            let battery = Battery.current()
+            let disk = Disk.startup()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.powerRunning = false
+                self.snap.battery = battery
+                self.snap.disk = disk
+            }
+        }
     }
 
     // MARK: CPU
@@ -229,7 +284,10 @@ public final class Metrics: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.psRunning = false
-                if let rows { self.processes = rows }
+                guard let rows else { return }
+                self.processes = rows
+                let name = self.tracker.observe(top: rows.first)
+                if name != self.culprit { self.culprit = name }
             }
         }
     }
